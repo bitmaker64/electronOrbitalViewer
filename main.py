@@ -1,14 +1,16 @@
-import sys
 import scipy
+import scipy.special
 try:
     import cupy as cp
     import cupyx.scipy.special as css
+    # Test if a CUDA device is actually responsive
+    _ = cp.cuda.runtime.getDeviceCount()
     HAS_GPU = True
-except ImportError:
-    import numpy as cp  #Use numpy as the 'cp' alias
+except:
+    import numpy as cp
     import scipy.special as css
     HAS_GPU = False
-import cupyx
+import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLabel, QLineEdit, QPushButton,
                               QStackedWidget, QSizePolicy)
@@ -18,7 +20,7 @@ from PyQt6.QtGui import QFont, QColor, QIcon
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import QUrl
 import plotly.graph_objects as go
-import tempfile, os, sys, ctypes
+import tempfile, os, sys, ctypes, gc
 
 # This tells Windows to treat this as a unique application
 myappid = 'OrbitalViewer'
@@ -27,17 +29,33 @@ try:
 except Exception as e:
     print(f"AppUserModelID Error: {e}")
 
-# ── math (unchanged) ──────────────────────────────────────────────────────────
+# ── math ──────────────────────────────────────────────────────────
 def sphHarm(l, m, theta, aziConst):
-    return aziConst * cupyx.scipy.special.lpmv(abs(m), l, cp.cos(theta))
+    return aziConst * css.lpmv(abs(m), l, cp.cos(theta))
 
-def normSphHarm(l, m):
-    a = (2*l+1)*scipy.special.factorial(l-abs(m)) / (4*cp.pi*scipy.special.factorial(l-abs(m)))
-    return cp.sqrt(cp.asarray(a))
+# def normSphHarm(l, m):
+#     a = (2*l+1)*scipy.special.factorial(l-abs(m)) / (4*cp.pi*scipy.special.factorial(l+abs(m)))
+#     return cp.sqrt(cp.asarray(a))
+#
+# def normRadial(n, l):
+#     a = ((2 / n) ** 3) * scipy.special.factorial(n - l - 1) / (2 * n * scipy.special.factorial(n + l))
+#     return cp.sqrt(cp.asarray(a))
 
 def normRadial(n, l):
-    a = ((2 / n) ** 3) * scipy.special.factorial(n - l + 1) / (2 * n * scipy.special.factorial(n + l))
-    return cp.sqrt(cp.asarray(a))
+    # n-l-1 factorial using log-gamma to prevent 'inf'
+    log_num = css.gammaln(n - l)
+    # 2n * (n+l)! in log space
+    log_den = cp.log(2 * n) + css.gammaln(n + l + 1)
+    # Full normalization constant in log space
+    log_a = 3 * cp.log(2 / n) + log_num - log_den
+    return cp.sqrt(cp.exp(log_a))
+
+def normSphHarm(l, m):
+    # sqrt((2l+1)/4pi * (l-m)!/(l+m)!)
+    log_num = css.gammaln(l - abs(m) + 1)
+    log_den = css.gammaln(l + abs(m) + 1)
+    log_const = cp.log((2 * l + 1) / (4 * cp.pi)) + log_num - log_den
+    return cp.sqrt(cp.exp(log_const))
 
 def azi(m, phi_array):
     if m > 0:   return cp.sqrt(2) * cp.cos(m * phi_array)
@@ -58,27 +76,88 @@ def probCalc(r, theta, phi, n, l, m, check_flag=0):
     return (R * Y) ** 2
 
 def maxProb(n, l, m, delta=1.05):
-    rlist, thetalist = cp.linspace(0, n*n+10, 200), cp.linspace(0, cp.pi, 50)
+    rlist, thetalist = cp.linspace(0, n*n+15, 500), cp.linspace(0, cp.pi, 200)
     rGrid, tGrid = cp.meshgrid(rlist, thetalist)
-    return cp.max(probCalc(rGrid, tGrid, cp.zeros_like(rGrid), n, l, m, 1)) * delta
+    # return cp.max(probCalc(rGrid, tGrid, cp.zeros_like(rGrid), n, l, m, 1)) * delta
+    p = probCalc(rGrid, tGrid, cp.zeros_like(rGrid), n, l, m, 1)
+    m_val = cp.max(p)
+
+    # Safety: If maxProb is 0, the math is broken
+    if m_val == 0:
+        return 1.0
+    return m_val * delta
+
 
 def generateCloud(n, l, m, sampleSize=100_000, delta=1.05):
-    L = n*n + n*l +10
-    x, y, z = (cp.random.uniform(-L, L, sampleSize) for _ in range(3))
-    testMaxProbs = cp.random.uniform(0, maxProb(n, l, m, delta), sampleSize)
-    r     = cp.sqrt(x*x + y*y + z*z)
-    theta = cp.arccos(z / r)
-    phi   = cp.arctan2(y, x)
-    probs = probCalc(r, theta, phi, n, l, m, 0)
-    mask  = probs >= testMaxProbs
-    return (x[mask].get() if HAS_GPU else x[mask],
-            y[mask].get() if HAS_GPU else y[mask],
-            z[mask].get() if HAS_GPU else z[mask],
-            probs[mask].get() if HAS_GPU else probs[mask])
+    L = n * n + n * l + 10
+    p_max = maxProb(n, l, m, delta)
+
+    # Pre-allocate CPU arrays using NumPy to avoid GPU memory pressure
+    # We use sampleSize as the maximum possible buffer size
+    final_x = np.empty(sampleSize, dtype=np.float32)
+    final_y = np.empty(sampleSize, dtype=np.float32)
+    final_z = np.empty(sampleSize, dtype=np.float32)
+    final_probs = np.empty(sampleSize, dtype=np.float32)
+
+    total_accepted = 0
+    chunk_size = 5_000_000  # Size of each chunk of VRAM
+
+    for start in range(0, sampleSize, chunk_size):
+        # Determine size for the current chunk
+        current_chunk = min(chunk_size, sampleSize - start)
+
+        # 1. Generate candidate points
+        x = cp.random.uniform(-L, L, current_chunk)
+        y = cp.random.uniform(-L, L, current_chunk)
+        z = cp.random.uniform(-L, L, current_chunk)
+        testMaxProbs = cp.random.uniform(0, p_max, current_chunk)
+
+        # 2. Coordinate conversion
+        r = cp.sqrt(x * x + y * y + z * z)
+        r = cp.where(r == 0, 1e-10, r)  # Avoid division by zero
+        theta = cp.arccos(cp.clip(z / r, -1, 1))
+        phi = cp.arctan2(y, x)
+
+        # 3. Probability check
+        probs = probCalc(r, theta, phi, n, l, m, 0)
+        mask = probs >= testMaxProbs
+
+        # 4. Extract accepted values directly to CPU
+        accepted_count = int(cp.sum(mask))
+        if accepted_count > 0:
+            # must not exceed the pre-allocated buffer
+            space_left = sampleSize - total_accepted
+            to_copy = min(accepted_count, space_left)
+
+            # Slice and get() only the accepted points
+            final_x[total_accepted: total_accepted + to_copy] = x[mask][:to_copy].get() if HAS_GPU else x[mask][
+                :to_copy]
+            final_y[total_accepted: total_accepted + to_copy] = y[mask][:to_copy].get() if HAS_GPU else y[mask][
+                :to_copy]
+            final_z[total_accepted: total_accepted + to_copy] = z[mask][:to_copy].get() if HAS_GPU else z[mask][
+                :to_copy]
+            final_probs[total_accepted: total_accepted + to_copy] = probs[mask][:to_copy].get() if HAS_GPU else \
+            probs[mask][:to_copy]
+
+            total_accepted += to_copy
+
+        # 5. Force clear GPU cache for this chunk
+        if HAS_GPU:
+            del x, y, z, testMaxProbs, r, theta, phi, probs, mask
+            cp.get_default_memory_pool().free_all_blocks()
+
+    # print(f"DEBUG: Accepted {total_accepted} points out of {sampleSize}")
+
+    # Return only the portions of the arrays that were actually filled
+    return (final_x[:total_accepted],
+            final_y[:total_accepted],
+            final_z[:total_accepted],
+            final_probs[:total_accepted])
 
 #NEW TEST FOR REPRESENTATION
 def buildFigureHTML(n, l, m, sampleSize=100_000, delta=1.05):
     x, y, z, density = generateCloud(n, l, m, sampleSize=sampleSize, delta=delta)
+
 
     fig = go.Figure(go.Scatter3d(
         x=x, y=y, z=z, mode='markers',
@@ -143,6 +222,13 @@ class RenderWorker(QThread):
     def run(self):
         try:
             path = buildFigureHTML(self.n, self.l, self.m, self.sampleSize, self.delta)
+
+            #frees VRAM
+            gc.collect()
+            if HAS_GPU:
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+
             self.finished.emit(path)
         except Exception as e:
             self.error.emit(str(e))
@@ -240,10 +326,10 @@ class TitleScreen(QWidget):
             "<div style='color: rgba(255,255,255,0.45); font-size: 16px;'>"
             "<p style='text-align: center; font-weight: bold; margin-bottom: 15px; color: rgba(255,255,255,0.6);'>EP Project Members</p>"
             "<table align='center' style='border-spacing: 10px 5px;'>"
-            "<tr><td style='text-align: right;'>By</td><td>:</td><td style='text-align: left;'>Neel Tendulkar</td></tr>"
-            "<tr><td style='text-align: right;'>Group member</td><td>:</td><td style='text-align: left;'>2</td></tr>"
-            "<tr><td style='text-align: right;'>Group member</td><td>:</td><td style='text-align: left;'>3</td></tr>"
-            "<tr><td style='text-align: right;'>Group member</td><td>:</td><td style='text-align: left;'>4</td></tr>"
+            "<tr><td style='text-align: right;'>Neel Tendulkar</td><td>:</td><td style='text-align: left;'>1262251509</td></tr>"
+            "<tr><td style='text-align: right;'>Medhansh Singh</td><td>:</td><td style='text-align: left;'>1262250758</td></tr>"
+            "<tr><td style='text-align: right;'>Hemal Trivedi</td><td>:</td><td style='text-align: left;'>1262251292</td></tr>"
+            "<tr><td style='text-align: right;'>Mohak Chaurasia</td><td>:</td><td style='text-align: left;'>1262253680</td></tr>"
             "</table>"
             "</div>"
         )
@@ -372,7 +458,7 @@ class PlotScreen(QWidget):
 
             s_text = self.s_in.text().strip()
             exp = float(s_text) if s_text else 5
-            assert 0 <= exp, "n must be positive" #floats work, they are just truncated
+            assert 0 <= exp <= 8, "n must be between 1 and 8" #floats work, they are just truncated
             sampleSize = int(10 ** exp) #said truncating logic
 
             del_text = self.del_in.text().strip()
