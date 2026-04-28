@@ -12,7 +12,7 @@ except:
     HAS_GPU = False
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
+                              QHBoxLayout, QLabel, QLineEdit, QComboBox, QPushButton,
                               QStackedWidget, QSizePolicy)
 from PyQt6.QtCore import (Qt, QPropertyAnimation, QEasingCurve, QPoint,
                            QParallelAnimationGroup, QThread, pyqtSignal)
@@ -28,6 +28,17 @@ try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception as e:
     print(f"AppUserModelID Error: {e}")
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    # Qt stylesheets prefer forward slashes / even on Windows
+    return os.path.join(base_path, relative_path).replace("\\", "/")
+
+icon_path = resource_path("3d0.ico")
+arrow_path = resource_path("arrow.png")
 
 # ── math ──────────────────────────────────────────────────────────
 def sphHarm(l, m, theta, aziConst):
@@ -73,13 +84,13 @@ def probCalc(r, theta, phi, n, l, m, check_flag=0):
     L_poly = cp.polyval(gpu_coeffs, rho)
     R = (normConst * cp.exp(-r / n) * (rho) ** l * L_poly)  # laguerre poly
     Y = normConstY * sphHarm(l, m, theta, aziConst)
-    return (R * Y) ** 2
+    return (R * Y) ** 2, cp.sign(R*Y)
 
 def maxProb(n, l, m, delta=1.05):
     rlist, thetalist = cp.linspace(0, n*n+15, 500), cp.linspace(0, cp.pi, 200)
     rGrid, tGrid = cp.meshgrid(rlist, thetalist)
     # return cp.max(probCalc(rGrid, tGrid, cp.zeros_like(rGrid), n, l, m, 1)) * delta
-    p = probCalc(rGrid, tGrid, cp.zeros_like(rGrid), n, l, m, 1)
+    p, _ = probCalc(rGrid, tGrid, cp.zeros_like(rGrid), n, l, m, 1)
     m_val = cp.max(p)
 
     # Safety: If maxProb is 0, the math is broken
@@ -88,7 +99,7 @@ def maxProb(n, l, m, delta=1.05):
     return m_val * delta
 
 
-def generateCloud(n, l, m, sampleSize=100_000, delta=1.05):
+def generateCloud(n, l, m, sampleSize=100_000, delta=1.05,option=0):
     L = n * n + n * l + 10
     p_max = maxProb(n, l, m, delta)
 
@@ -98,6 +109,7 @@ def generateCloud(n, l, m, sampleSize=100_000, delta=1.05):
     final_y = np.empty(sampleSize, dtype=np.float32)
     final_z = np.empty(sampleSize, dtype=np.float32)
     final_probs = np.empty(sampleSize, dtype=np.float32)
+    final_phases = np.empty(sampleSize, dtype=np.float32)
 
     total_accepted = 0
     chunk_size = 5_000_000  # Size of each chunk of VRAM
@@ -119,7 +131,7 @@ def generateCloud(n, l, m, sampleSize=100_000, delta=1.05):
         phi = cp.arctan2(y, x)
 
         # 3. Probability check
-        probs = probCalc(r, theta, phi, n, l, m, 0)
+        probs, phases = probCalc(r, theta, phi, n, l, m, 0)
         mask = probs >= testMaxProbs
 
         # 4. Extract accepted values directly to CPU
@@ -130,14 +142,20 @@ def generateCloud(n, l, m, sampleSize=100_000, delta=1.05):
             to_copy = min(accepted_count, space_left)
 
             # Slice and get() only the accepted points
-            final_x[total_accepted: total_accepted + to_copy] = x[mask][:to_copy].get() if HAS_GPU else x[mask][
-                :to_copy]
-            final_y[total_accepted: total_accepted + to_copy] = y[mask][:to_copy].get() if HAS_GPU else y[mask][
-                :to_copy]
-            final_z[total_accepted: total_accepted + to_copy] = z[mask][:to_copy].get() if HAS_GPU else z[mask][
-                :to_copy]
-            final_probs[total_accepted: total_accepted + to_copy] = probs[mask][:to_copy].get() if HAS_GPU else \
-            probs[mask][:to_copy]
+            final_x[total_accepted: total_accepted + to_copy] = x[mask][:to_copy].get() if HAS_GPU else x[mask][:to_copy]
+            final_y[total_accepted: total_accepted + to_copy] = y[mask][:to_copy].get() if HAS_GPU else y[mask][:to_copy]
+            final_z[total_accepted: total_accepted + to_copy] = z[mask][:to_copy].get() if HAS_GPU else z[mask][:to_copy]
+
+            if option == 0:
+                final_probs[total_accepted: total_accepted + to_copy] = probs[mask][:to_copy].get() if HAS_GPU else probs[mask][:to_copy]
+            else:
+                p_val = probs[mask][:to_copy]
+                ph_val = phases[mask][:to_copy]
+                if option == 1:
+                    final_probs[total_accepted: total_accepted + to_copy] = (cp.sqrt(p_val) * ph_val).get() if HAS_GPU else (cp.sqrt(p_val) * ph_val) # this function is normalized to show the phases more distinctly for higher values of l, m, n. The actual function is p_val * ph_val
+                    # final_probs[total_accepted: total_accepted + to_copy] = (p_val * ph_val).get() if HAS_GPU else (p_val * ph_val) # shows the density along with the sign (the actual wave function), but it just shows everything as white in higher orbital since the centre is extremely dense
+                else: final_probs[total_accepted: total_accepted + to_copy] = ph_val.get() if HAS_GPU else ph_val  # this shows ONLY the sign
+
 
             total_accepted += to_copy
 
@@ -155,24 +173,37 @@ def generateCloud(n, l, m, sampleSize=100_000, delta=1.05):
             final_probs[:total_accepted])
 
 #NEW TEST FOR REPRESENTATION
-def buildFigureHTML(n, l, m, sampleSize=100_000, delta=1.05):
-    x, y, z, density = generateCloud(n, l, m, sampleSize=sampleSize, delta=delta)
+def buildFigureHTML(n, l, m, sampleSize=100_000, delta=1.05,option = 0):
+    x, y, z, density = generateCloud(n, l, m, sampleSize=sampleSize, delta=delta,option=option)
 
+    marker_setting=dict(
+        size=3.5,
+        color=density,
+        opacity=0.1,  # Bumped slightly so the glowing edges are more visible
+        colorbar=dict(
+            title='Probability Density (Ψ<sup>2</sup>)',
+            tickfont=dict(color='white'),
+        ),
+        line=dict(width=0),)
+
+    if option == 0:
+        marker_setting['colorscale'] = 'Turbo' # Turbo and Inferno look good for this
+        title = 'Probability Density'
+    else:
+        marker_setting['colorscale'] = 'RdBu' # only this really fits here sadly
+        marker_setting['cmid'] = 0
+        if option == 1:
+            marker_setting['colorbar'] = dict(
+                title='Wavefunction (Ψ)',)
+            title = 'Wavefunction'
+        else:
+            marker_setting['colorbar'] = dict(
+                title='Phase (±)',)
+            title = 'Phase Topology'
 
     fig = go.Figure(go.Scatter3d(
         x=x, y=y, z=z, mode='markers',
-        marker=dict(
-            size=3.5,
-            color=density,
-            # 'Inferno', 'Plasma', 'Turbo'
-            colorscale='Turbo',
-            opacity=0.1,  # Bumped slightly so the glowing edges are more visible
-            colorbar=dict(
-                title='Probability Density',
-                tickfont=dict(color='white'),
-            ),
-            line=dict(width=0),
-        ),
+        marker=marker_setting,
     ))
 
     # A reusable style dictionary so we don't repeat ourselves for x, y, z
@@ -186,7 +217,7 @@ def buildFigureHTML(n, l, m, sampleSize=100_000, delta=1.05):
     )
 
     fig.update_layout(
-        title=dict(text=f"Hydrogen Orbital Density (n={n}, l={l}, m={m})<br>On all axes: 1 unit = 1 Bohr radius (a<sub>0</sub>) = 5.29×10<sup>−11</sup> m",
+        title=dict(text=f"Hydrogen Orbital {title} (n={n}, l={l}, m={m})<br>On all axes: 1 unit = 1 Bohr radius (a<sub>0</sub>) = 5.29×10<sup>−11</sup> m",
                    font=dict(color='white')),
         scene=dict(
             xaxis=axis_style,
@@ -213,15 +244,16 @@ class RenderWorker(QThread):
     finished = pyqtSignal(str)
     error    = pyqtSignal(str)
 
-    def __init__(self, n, l, m, sampleSize, delta):
+    def __init__(self, n, l, m, sampleSize, delta, option):
         super().__init__()
         self.n, self.l, self.m = n, l, m
         self.sampleSize = sampleSize
         self.delta = delta
+        self.option = option
 
     def run(self):
         try:
-            path = buildFigureHTML(self.n, self.l, self.m, self.sampleSize, self.delta)
+            path = buildFigureHTML(self.n, self.l, self.m, self.sampleSize, self.delta, self.option)
 
             #frees VRAM
             gc.collect()
@@ -234,28 +266,29 @@ class RenderWorker(QThread):
             self.error.emit(str(e))
 
 # ── stylesheet ────────────────────────────────────────────────────────────────
-DARK = """
-QWidget {
+def stylesheet(arrow = arrow_path):
+    return f'''
+QWidget {{
     background-color: #000000;
     color: #ffffff;
     font-family: -apple-system, 'SF Pro Display', 'Segoe UI', sans-serif;
-}
-QLabel { background: transparent; color: #ffffff; }
+}}
+QLabel {{ background: transparent; color: #ffffff; }}
 
-QLineEdit {
+QLineEdit {{
     background-color: rgba(255,255,255,0.07);
     border: 0.5px solid rgba(255,255,255,0.18);
     border-radius: 10px;
     padding: 8px 14px;
     color: #ffffff;
     font-size: 15px;
-}
-QLineEdit:focus {
+}}
+QLineEdit:focus {{
     border: 0.5px solid rgba(255,255,255,0.55);
     background-color: rgba(255,255,255,0.11);
-}
+}}
 
-QPushButton {
+QPushButton {{
     background-color: rgba(255,255,255,0.10);
     border: 0.5px solid rgba(255,255,255,0.22);
     border-radius: 12px;
@@ -263,15 +296,48 @@ QPushButton {
     color: #ffffff;
     font-size: 14px;
     letter-spacing: 0.3px;
-}
-QPushButton:hover {
+}}
+QPushButton:hover {{
     background-color: rgba(255,255,255,0.18);
     border: 0.5px solid rgba(255,255,255,0.40);
-}
-QPushButton:pressed { background-color: rgba(255,255,255,0.06); }
-QPushButton:disabled { color: rgba(255,255,255,0.25); }
-QStackedWidget { background-color: #000000; }
-"""
+}}
+QPushButton:pressed {{ background-color: rgba(255,255,255,0.06); }}
+QPushButton:disabled {{ color: rgba(255,255,255,0.25); }}
+
+QComboBox {{
+    background-color: rgba(255,255,255,0.07);
+    border: 0.5px solid rgba(255,255,255,0.18);
+    border-radius: 10px;
+    padding: 0px 14px;
+    color: #ffffff;
+}}
+QComboBox::drop-down {{
+    border: 0px;
+}}
+QComboBox::down-arrow {{
+    /* Use the relative path to your file */
+    image: url("{arrow_path}");
+    width: 9px;
+    height: 9px;
+    margin-right: 15px;
+}}
+QComboBox:focus {{
+    border: 0.5px solid rgba(255,255,255,0.55);
+    background-color: rgba(255,255,255,0.11);
+}}
+/* Style for the list that pops out */
+QComboBox QAbstractItemView {{
+    background-color: #121212;
+    color: white;
+    selection-background-color: #333333;
+    border: 0.5px solid rgba(255,255,255,0.2);
+    outline: none;
+}}
+
+QStackedWidget {{ background-color: #000000; }}
+'''
+
+# DARK =
 
 # ── slide transition ──────────────────────────────────────────────────────────
 def slide_transition(stack, new_widget):
@@ -387,6 +453,23 @@ class PlotScreen(QWidget):
             col.addWidget(inp)
             return col, inp
 
+        def labeled_dropdown(label_text, items, width=150):
+            col = QVBoxLayout()
+            col.setSpacing(6)
+
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet("color: rgba(255,255,255,0.38); font-size: 11px; letter-spacing: 1.2px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            combo = QComboBox()
+            combo.addItems(items)
+            combo.setFixedWidth(width)
+            combo.setFixedHeight(40)
+            # Apply your custom styling here or in the main DARK stylesheet
+            col.addWidget(lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+            col.addWidget(combo)
+            return col, combo
+
         n_col, self.n_in   = labeled_input("N")
         l_col, self.l_in   = labeled_input("L")
         m_col, self.m_in   = labeled_input("M")
@@ -395,6 +478,8 @@ class PlotScreen(QWidget):
         self.s_in.setPlaceholderText("5")
         del_col, self.del_in = labeled_input("Delta", width=110)
         self.del_in.setPlaceholderText("1.05")
+        option_col, self.option_in = labeled_dropdown("Render Mode", ["Probability Density", "Wavefunction", "Phase ONLY"])
+        self.option_in.setPlaceholderText("0")
 
         self.plot_btn = QPushButton("Render")
         self.plot_btn.setFixedWidth(130)
@@ -411,6 +496,7 @@ class PlotScreen(QWidget):
         row.addLayout(m_col)
         row.addLayout(s_col)
         row.addLayout(del_col)
+        row.addLayout(option_col)
         row.addSpacing(8)
         row.addWidget(self.plot_btn, alignment=Qt.AlignmentFlag.AlignBottom)
         row.addWidget(self.status,   alignment=Qt.AlignmentFlag.AlignBottom)
@@ -465,6 +551,8 @@ class PlotScreen(QWidget):
             delta = float(del_text) if del_text else 1.05
             assert 1 <= delta <=2, "delta must be between 1 and 2" #less than one and it will accept too many points in the orbital. More than 2 and it will reject way too many
 
+            option = self.option_in.currentIndex()
+
         except AssertionError as e:
             self.status.setText(str(e) if str(e) else "invalid n, l, m values")
             return
@@ -475,7 +563,7 @@ class PlotScreen(QWidget):
         self.status.setText(f"computing  {sampleSize:,} points…")
         self.plot_btn.setEnabled(False)
 
-        self._worker = RenderWorker(n, l, m, sampleSize, delta)
+        self._worker = RenderWorker(n, l, m, sampleSize, delta,option)
         self._worker.finished.connect(self._on_done)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -510,8 +598,6 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
-        if hasattr(sys, '_MEIPASS'): icon_path = os.path.join(sys._MEIPASS, "3d0.ico")
-        else: icon_path = "3d0.ico"
         self.setWindowIcon(QIcon(icon_path))
 
         self.title_screen = TitleScreen(on_go=self.go_to_plot)
@@ -531,7 +617,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"AppUserModelID Error: {e}")
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK)
+    app.setStyleSheet(stylesheet(arrow_path))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
