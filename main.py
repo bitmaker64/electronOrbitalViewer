@@ -1,11 +1,18 @@
 import scipy
 import scipy.special
+import scipy
+import scipy.special
+import tempfile, os, sys, ctypes, gc
+
 try:
     import cupy as cp
     import cupyx.scipy.special as css
     # Test if a CUDA device is actually responsive
     _ = cp.cuda.runtime.getDeviceCount()
     HAS_GPU = True
+    if getattr(sys, 'frozen', False):
+        bundle_dir = sys._MEIPASS
+        os.environ['LD_LIBRARY_PATH'] = f"{bundle_dir}:{os.environ.get('LD_LIBRARY_PATH', '')}"
 except:
     import numpy as cp
     import scipy.special as css
@@ -20,7 +27,6 @@ from PyQt6.QtGui import QFont, QColor, QIcon
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import QUrl
 import plotly.graph_objects as go
-import tempfile, os, sys, ctypes, gc
 
 # This tells Windows to treat this as a unique application
 myappid = 'OrbitalViewer'
